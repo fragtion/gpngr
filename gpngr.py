@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-# pingtracer.py -- pygame live ping grapher
-# pip install pygame
+# gpngr.py -- pygame-based multi-platform live ping grapher, inspired by PingTracer
+# version 0.1
+
 import argparse, math, platform, re, socket, struct, subprocess
 import sys, threading, time, os, select
 
@@ -734,7 +735,7 @@ class GraphCell:
 def main():
     global DEBUG, TIMEOUT, PAYLOAD_SIZE
 
-    ap = argparse.ArgumentParser(prog="pingtracer")
+    ap = argparse.ArgumentParser(prog="gpngr")
     ap.add_argument("hosts", nargs="+")
     ap.add_argument("--rows",     type=int,   default=None)
     ap.add_argument("--cols",     type=int,   default=None)
@@ -763,7 +764,7 @@ def main():
     os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
     pygame.init()
-    pygame.display.set_caption("PingTracer")
+    pygame.display.set_caption("gpngr")
 
     def get_bold_font(size):
         font_names = ['DejaVu Sans Mono', 'Courier New', 'Consolas', 'Monospace']
@@ -809,7 +810,7 @@ def main():
     layout_cells()
     clock = pygame.time.Clock()
 
-    print("PingTracer  --  F=fullscreen toggle  Q=quit")
+    print("gpngr --  F=fullscreen toggle  Q=quit")
     print("Pinging: %s" % ", ".join(c[I_HOST] for c in cfgs))
     if DEBUG:
         print("Debug mode enabled")
@@ -826,7 +827,7 @@ def main():
                     fullscreen = False
                     screen = pygame.display.set_mode((args.width, args.height), pygame.RESIZABLE)
                     layout_cells()
-                    pygame.display.set_caption("PingTracer")
+                    pygame.display.set_caption("gpngr")
                 elif event.key == pygame.K_f:
                     fullscreen = not fullscreen
                     if fullscreen:
