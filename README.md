@@ -27,11 +27,10 @@ Pinging: 1.1.1.1, 129.151.169.143, 192.168.10.15, 192.168.10.16, 10.13.1.22, 10.
 
 ## Differences from pngr
 
-While [pngr](https://github.com/fragtion/pngr) focuses on terminal-based rendering for SSH/low-bandwidth environments, **gpngr** provides:
+While [pngr](https://github.com/fragtion/pngr) focuses on terminal-based rendering, **gpngr** provides:
 
-- **Graphical interface** with mouse/keyboard interaction
+- **A native graphical interface** with mouse/keyboard interaction
 - **Higher resolution** rendering (full pixel-perfect graphs)
-- **Color-coded zones** for warning and critical thresholds
 - **Better visibility** with anti-aliased text and grid lines
 - **Native window management** (resizable, fullscreen toggle)
 - **No terminal bandwidth issues** - renders locally using Pygame
