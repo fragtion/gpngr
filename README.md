@@ -6,6 +6,13 @@ Inspired by [PingTracer](https://github.com/bp2008/pingtracer), and evolved from
 
 ## Preview
 
+```
+E:\Users\Administrator\Desktop>python3 mgping.py "1.1.1.1{5,0,10,4,6},129.151.169.143{5,0,30,22,27},192.168.10.15{100,0,10,4,6},192.168.10.16{10,0,10,4,6},10.13.1.22{5,165,300,180,200},10.1.7.1{5,165,300,180,200},192.168.10.1{10,0,10,4,6},192.168.10.50{10,0,10,4,6}" --rows 2
+pygame 2.6.1 (SDL 2.28.4, Python 3.13.13)
+Hello from the pygame community. https://www.pygame.org/contribute.html
+gpngr --  F=fullscreen toggle  Q=quit
+Pinging: 1.1.1.1, 129.151.169.143, 192.168.10.15, 192.168.10.16, 10.13.1.22, 10.1.7.1, 192.168.10.1, 192.168.10.50
+```
 ![gpngr screenshot](screenshot.png)
 
 ## Features
