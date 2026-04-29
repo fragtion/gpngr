@@ -1,0 +1,197 @@
+name: Release Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Linux: native builds on GitHub-hosted runners
+  # x86_64 and aarch64 built natively; i386 cross-compiled via gcc-multilib
+  # apt-get update run before install to avoid stale mirror cache (libpng etc)
+  # ---------------------------------------------------------------------------
+  build-linux:
+    name: Linux (${{ matrix.artifact }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            artifact: gpngr-linux-x86_64
+            cross: false
+          - runner: ubuntu-24.04-arm
+            artifact: gpngr-linux-aarch64
+            cross: false
+          - runner: ubuntu-latest
+            artifact: gpngr-linux-i386
+            cross: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps (native x86_64 / aarch64)
+        if: matrix.cross == false
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev libxext-dev libxft-dev libfontconfig-dev
+
+      - name: Install deps (i386 cross)
+        if: matrix.cross == true
+        run: |
+          sudo apt-get update
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-multilib \
+            libx11-dev:i386 libxext-dev:i386 libxft-dev:i386 \
+            libfontconfig-dev:i386 libfreetype-dev:i386 \
+            libpng-dev:i386 zlib1g-dev:i386
+
+      - name: Build (native)
+        if: matrix.cross == false
+        run: |
+          gcc -O2 -o ${{ matrix.artifact }} gpngr.c \
+            -lm -lpthread -lrt -lX11 -lXext -lXft \
+            -I/usr/include/freetype2
+
+      - name: Build (i386)
+        if: matrix.cross == true
+        run: |
+          gcc -m32 -O2 -o ${{ matrix.artifact }} gpngr.c \
+            -lm -lpthread -lrt -lX11 -lXext -lXft \
+            -I/usr/include/freetype2
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  # ---------------------------------------------------------------------------
+  # macOS: Intel (x86_64) and Apple Silicon (aarch64)
+  # Built natively on respective runners; X11 via XQuartz
+  # ---------------------------------------------------------------------------
+  build-macos:
+    name: macOS (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15        # Intel
+            artifact: gpngr-macos-x86_64
+          - runner: macos-14        # Apple Silicon (M1)
+            artifact: gpngr-macos-aarch64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XQuartz (X11)
+        run: brew install --cask xquartz || true
+
+      - name: Build
+        run: |
+          # XQuartz installs to /opt/X11; freetype2 headers live one level deeper
+          gcc -O2 -o ${{ matrix.artifact }} gpngr.c \
+            -lm -lpthread \
+            -I/opt/X11/include \
+            -I/opt/X11/include/freetype2 \
+            -L/opt/X11/lib \
+            -lX11 -lXext -lXft \
+            || \
+          gcc -O2 -o ${{ matrix.artifact }} gpngr.c \
+            -lm -lpthread \
+            -lX11 -lXext -lXft
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  # ---------------------------------------------------------------------------
+  # Windows: 32-bit and 64-bit via MinGW cross-compiler on Ubuntu
+  # ---------------------------------------------------------------------------
+  build-windows:
+    name: Windows (${{ matrix.artifact }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - triplet: x86_64-w64-mingw32
+            artifact: gpngr-windows-x86_64.exe
+          - triplet: i686-w64-mingw32
+            artifact: gpngr-windows-i386.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MinGW
+        run: sudo apt-get install -y gcc-mingw-w64
+
+      - name: Build
+        run: |
+          ${{ matrix.triplet }}-gcc -O2 \
+            -o ${{ matrix.artifact }} \
+            gpngr.c \
+            -lws2_32 -lwinmm -lgdi32 -luser32 -lmsimg32 \
+            -mwindows \
+            -static
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  # ---------------------------------------------------------------------------
+  # FreeBSD: built in a VM via vmactions/freebsd-vm (x86_64 only)
+  # pkg-config cflags passed explicitly so ft2build.h is found
+  # ---------------------------------------------------------------------------
+  build-freebsd:
+    name: FreeBSD (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build in FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            pkg install -y gcc xorg-libraries libXft pkgconf
+          run: |
+            PKGCFLAGS=$(pkg-config --cflags fontconfig freetype2 2>/dev/null || true)
+            PKGLIBS=$(pkg-config --libs fontconfig freetype2 2>/dev/null || true)
+            gcc -O2 $PKGCFLAGS \
+              -o gpngr-freebsd-x86_64 gpngr.c \
+              -lm -lpthread -lX11 -lXext -lXft \
+              $PKGLIBS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gpngr-freebsd-x86_64
+          path: gpngr-freebsd-x86_64
+
+  # ---------------------------------------------------------------------------
+  # Create GitHub Release and attach all binaries
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish Release
+    needs: [build-linux, build-macos, build-windows, build-freebsd]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
