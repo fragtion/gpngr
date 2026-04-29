@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # gpngr.py -- pygame-based multi-platform live ping grapher, inspired by PingTracer
-# version 0.1
+# version 0.2
 
 import argparse, math, platform, re, socket, struct, subprocess
 import sys, threading, time, os, select
@@ -94,50 +94,32 @@ def detect_sock_mode():
 def _checksum(data):
     """Standard ICMP checksum calculation"""
     s = 0
-    # Make sure we have even length
     if len(data) % 2 == 1:
         data += b'\x00'
-    
-    # Sum 16-bit words
     for i in range(0, len(data), 2):
         w = (data[i] << 8) + data[i + 1]
         s += w
-    
-    # Fold 32-bit sum to 16 bits
     s = (s >> 16) + (s & 0xffff)
     s += (s >> 16)
     return ~s & 0xffff
 
 def _build_packet(identifier, sequence):
     """Build a proper ICMP Echo Request packet (RFC 792 compliant)"""
-    # Force values into 16-bit range
     identifier = identifier & 0xFFFF
-    sequence = sequence & 0xFFFF
-    
-    # ICMP header: type=8, code=0, checksum=0, identifier, sequence
-    header = struct.pack('!BBHHH', 8, 0, 0, identifier, sequence)
-    
-    # Create timestamp payload (8 bytes: seconds and microseconds)
-    now = time.time()
-    sec = int(now) & 0xFFFFFFFF
+    sequence   = sequence   & 0xFFFF
+    header     = struct.pack('!BBHHH', 8, 0, 0, identifier, sequence)
+    now  = time.time()
+    sec  = int(now) & 0xFFFFFFFF
     usec = int((now - int(now)) * 1000000) & 0xFFFFFFFF
     timestamp = struct.pack('!II', sec, usec)
-    
-    # Build data payload
     if PAYLOAD_SIZE > 8:
         data = timestamp + b'\xAA' * (PAYLOAD_SIZE - 8)
     elif PAYLOAD_SIZE == 8:
         data = timestamp
     else:
         data = timestamp[:PAYLOAD_SIZE] if PAYLOAD_SIZE > 0 else b''
-    
-    # Complete packet
     packet = header + data
-    
-    # Calculate checksum
-    chk = _checksum(packet)
-    
-    # Replace checksum in packet
+    chk    = _checksum(packet)
     return packet[:2] + struct.pack('!H', chk) + packet[4:]
 
 def _system_ping(host, timeout):
@@ -148,7 +130,6 @@ def _system_ping(host, timeout):
         else:
             cmd = ["ping", "-c", "1", "-W", str(max(1, int(timeout))), host]
         out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True, timeout=timeout+1)
-        # Parse different ping output formats
         m = re.search(r'time[=<>]\s*([\d\.]+)\s*ms', out, re.IGNORECASE)
         if m:
             return float(m.group(1))
@@ -168,108 +149,94 @@ class ICMPManager:
         self.sock    = None
         self.mode    = detect_sock_mode()
         self.running = True
-        
+
         if self.mode in ("raw", "dgram"):
             try:
-                stype = socket.SOCK_RAW if self.mode == "raw" else socket.SOCK_DGRAM
+                stype     = socket.SOCK_RAW if self.mode == "raw" else socket.SOCK_DGRAM
                 self.sock = socket.socket(socket.AF_INET, stype, socket.IPPROTO_ICMP)
-                # Set socket options for better performance
                 self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256*1024)
-                self.sock.settimeout(0.1)  # Non-blocking with timeout
-                
+                self.sock.settimeout(0.1)
+
                 if DEBUG:
                     sys.stderr.write(f"[icmp] initialized with mode={self.mode}\n")
-                
-                # Start receiver thread
+
                 self.recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
                 self.recv_thread.start()
-                
+
             except (PermissionError, OSError) as ex:
                 if DEBUG:
                     sys.stderr.write(f"[icmp] failed to create socket: {ex}\n")
                 self.sock = None
                 self.mode = "system"
-        
+
         if self.mode == "system":
             if DEBUG:
                 sys.stderr.write("[icmp] using system ping fallback\n")
 
-    def request(self, host, timeout, ident, seq):
-        """Send ping and wait for response"""
-        # Resolve hostname
-        try:
-            dest_ip = socket.gethostbyname(host)
-        except socket.gaierror:
-            if DEBUG:
-                sys.stderr.write(f"[icmp] DNS resolution failed: {host}\n")
-            return None
-        
-        # Use system ping if no raw socket
+    def request(self, dest_ip, host, timeout, ident, seq):
+        """Send ping and wait for response.
+
+        dest_ip is a pre-resolved IP string (supplied by Worker to avoid
+        per-ping DNS overhead inflating RTT measurements).
+        """
         if self.sock is None or self.mode == "system":
             return _system_ping(host, timeout)
-        
-        # Force values into 16-bit range
+
         ident = ident & 0xFFFF
-        seq = seq & 0xFFFF
-        
-        key = (dest_ip, ident, seq)
-        ev = threading.Event()
-        entry = {
-            'event': ev,
-            'result': None,
-            'send_ts': time.monotonic(),
-            'host': host
-        }
-        
+        seq   = seq   & 0xFFFF
+        key   = (dest_ip, ident, seq)
+        ev    = threading.Event()
+        # send_ts is set to None here; it will be stamped as late as possible,
+        # immediately before the actual sendto() call, so that lock-acquisition
+        # time and GIL pressure are not counted as network latency.
+        entry = {'event': ev, 'result': None, 'send_ts': None, 'host': host}
+
         with self.lock:
             self.pending[key] = entry
-        
-        # Build and send packet
+
+        # Build the packet before touching the socket so there is no work
+        # (and therefore no delay) between stamping send_ts and sendto().
         packet = _build_packet(ident, seq)
-        
+
         try:
-            bytes_sent = self.sock.sendto(packet, (dest_ip, 0))
-            if DEBUG:
-                sys.stderr.write(f"[icmp] sent {bytes_sent} bytes to {dest_ip} id={ident} seq={seq}\n")
+            # Stamp send time as late as possible — right before the send.
+            entry['send_ts'] = time.monotonic()
+            self.sock.sendto(packet, (dest_ip, 0))
         except Exception as e:
             if DEBUG:
                 sys.stderr.write(f"[icmp] sendto error: {e}\n")
             with self.lock:
                 self.pending.pop(key, None)
             return _system_ping(host, timeout)
-        
-        # Wait for response
+
         ev.wait(timeout)
-        
-        # Get result
+
         with self.lock:
             entry = self.pending.pop(key, entry)
-            # Cleanup old entries
-            now = time.monotonic()
-            stale = [k for k, e in self.pending.items() 
-                    if now - e['send_ts'] > timeout * 2]
+            now   = time.monotonic()
+            stale = [k for k, e in self.pending.items()
+                     if e['send_ts'] is not None and now - e['send_ts'] > timeout * 2]
             for k in stale:
                 self.pending.pop(k, None)
-        
+
         result = entry.get('result')
         if DEBUG:
             if result is None:
                 sys.stderr.write(f"[icmp] timeout for {dest_ip} id={ident} seq={seq}\n")
             else:
                 sys.stderr.write(f"[icmp] reply from {dest_ip}: {result:.2f}ms\n")
-        
+
         return result
 
     def _recv_loop(self):
         """Receive thread for ICMP replies"""
         while self.running:
             try:
-                # Set a short timeout to allow checking self.running
                 if self.sock:
                     self.sock.settimeout(0.1)
                 else:
                     break
-                
+
                 try:
                     recvd, addr = self.sock.recvfrom(4096)
                 except socket.timeout:
@@ -278,67 +245,55 @@ class ICMPManager:
                     if DEBUG and e.errno not in (socket.EAGAIN, socket.EWOULDBLOCK):
                         sys.stderr.write(f"[icmp] recv error: {e}\n")
                     continue
-                
+
                 if not recvd:
                     continue
-                
+
+                # Stamp receive time immediately after recvfrom() returns,
+                # before acquiring the lock, so contention doesn't inflate RTT.
                 recv_ts = time.monotonic()
-                
-                # Parse ICMP packet
-                # Skip IP header (20 bytes) for raw sockets
+
                 offset = 20 if self.mode == 'raw' else 0
-                
+
                 if len(recvd) < offset + 8:
                     continue
-                
-                # Extract ICMP header
+
                 icmp_type, icmp_code, checksum, icmp_id, icmp_seq = struct.unpack(
                     '!BBHHH', recvd[offset:offset+8]
                 )
-                
-                # Only process Echo Reply (type 0)
+
                 if icmp_type != 0 or icmp_code != 0:
                     continue
-                
-                # Build key to find pending request
-                # For DGRAM sockets, the source IP might be different
+
                 if self.mode == 'dgram':
-                    # Try to find by sequence number only (more flexible)
                     with self.lock:
                         found_key = None
                         for key in self.pending:
-                            if key[2] == icmp_seq:  # Match by sequence
+                            if key[2] == icmp_seq:
                                 found_key = key
                                 break
-                        
                         if found_key:
                             entry = self.pending.get(found_key)
-                            if entry:
+                            if entry and entry['send_ts'] is not None:
                                 elapsed = (recv_ts - entry['send_ts']) * 1000
-                                if 0 < elapsed < 60000:
-                                    entry['result'] = elapsed
-                                else:
-                                    entry['result'] = None
+                                entry['result'] = elapsed if 0 < elapsed < 60000 else None
                                 entry['event'].set()
                                 if DEBUG:
                                     sys.stderr.write(f"[icmp] matched reply via seq {icmp_seq}\n")
                 else:
-                    # For raw sockets, use exact match
                     key = (addr[0], icmp_id, icmp_seq)
                     with self.lock:
                         entry = self.pending.get(key)
-                        if entry:
+                        if entry and entry['send_ts'] is not None:
                             elapsed = (recv_ts - entry['send_ts']) * 1000
-                            if 0 < elapsed < 60000:
-                                entry['result'] = elapsed
-                            else:
-                                entry['result'] = None
+                            entry['result'] = elapsed if 0 < elapsed < 60000 else None
                             entry['event'].set()
+
             except Exception as e:
                 if DEBUG:
                     sys.stderr.write(f"[icmp] recv_loop error: {e}\n")
                 time.sleep(0.1)
-    
+
     def shutdown(self):
         self.running = False
         if self.sock:
@@ -348,7 +303,7 @@ class ICMPManager:
                 pass
 
 _icmp_manager = None
-_mgr_lock = threading.Lock()
+_mgr_lock     = threading.Lock()
 
 def get_manager():
     global _icmp_manager
@@ -358,14 +313,12 @@ def get_manager():
         return _icmp_manager
 
 _ident_counter = 0
-_ident_lock = threading.Lock()
+_ident_lock    = threading.Lock()
 
 def _next_ident():
     global _ident_counter
     with _ident_lock:
-        _ident_counter = (_ident_counter + 1) & 0xFFFF  # Use bitmask instead of modulo
-        if _ident_counter > 65535:
-            _ident_counter = 0
+        _ident_counter = (_ident_counter + 1) & 0xFFFF
         return _ident_counter
 
 # ---------------------------------------------------------------------------
@@ -375,40 +328,58 @@ def _next_ident():
 class Worker(threading.Thread):
     def __init__(self, host, rate):
         super().__init__(daemon=True)
-        self.host       = host
-        self.rate       = rate
-        self._lock      = threading.Lock()
-        self._resolved  = []
-        self._seq       = 0
-        self._ident     = _next_ident()
-        self._running   = True
+        self.host        = host
+        self.rate        = rate
+        self._lock       = threading.Lock()
+        self._resolved   = []
+        self._seq        = 0
+        self._ident      = _next_ident()
+        self._running    = True
+        # Cache the resolved IP so DNS lookup is not performed on every ping.
+        # A failed lookup is retried on the next ping cycle.
+        self._dest_ip    = None
+
+    def _resolve_ip(self):
+        """Resolve hostname to IP, caching the result. Returns None on failure."""
+        if self._dest_ip is not None:
+            return self._dest_ip
+        try:
+            self._dest_ip = socket.gethostbyname(self.host)
+            if DEBUG:
+                sys.stderr.write(f"[worker] resolved {self.host} -> {self._dest_ip}\n")
+        except socket.gaierror as e:
+            if DEBUG:
+                sys.stderr.write(f"[worker] DNS failed for {self.host}: {e}\n")
+        return self._dest_ip
 
     def run(self):
         interval = 1.0 / max(0.1, self.rate)
         while self._running:
             start_time = time.monotonic()
-            
-            # Send ping in a separate thread to not block
-            self._seq = (self._seq + 1) & 0xFFFF  # Use bitmask instead of modulo
-            if self._seq > 65535:
-                self._seq = 0
+
+            self._seq = (self._seq + 1) & 0xFFFF
             seq = self._seq
             thread = threading.Thread(target=self._ping, args=(seq,), daemon=True)
             thread.start()
-            
-            # Calculate next tick time
-            elapsed = time.monotonic() - start_time
+
+            elapsed    = time.monotonic() - start_time
             sleep_time = max(0, interval - elapsed)
             if sleep_time > 0:
                 time.sleep(sleep_time)
-    
+
     def _ping(self, seq):
         try:
-            result = get_manager().request(self.host, TIMEOUT, self._ident, seq)
-            
+            dest_ip = self._resolve_ip()
+            if dest_ip is None:
+                # DNS resolution failed; record a loss and try again next cycle.
+                with self._lock:
+                    self._resolved.append(None)
+                return
+
+            result = get_manager().request(dest_ip, self.host, TIMEOUT, self._ident, seq)
+
             with self._lock:
                 self._resolved.append(result)
-                # Keep last 1 hour of data (3600 * rate)
                 max_samples = int(3600 * self.rate)
                 if len(self._resolved) > max_samples:
                     self._resolved = self._resolved[-max_samples:]
@@ -417,7 +388,7 @@ class Worker(threading.Thread):
                 sys.stderr.write(f"[worker] error: {e}\n")
             with self._lock:
                 self._resolved.append(None)
-    
+
     def stop(self):
         self._running = False
 
@@ -432,7 +403,7 @@ class Worker(threading.Thread):
             return self._resolved[-n:] if len(self._resolved) >= n else self._resolved[:]
 
 # ---------------------------------------------------------------------------
-# GraphCell (unchanged from previous version)
+# GraphCell
 # ---------------------------------------------------------------------------
 
 def auto_layout(n, forced_rows=None, forced_cols=None):
@@ -453,49 +424,40 @@ def severity_color(val, warn, bad):
 
 class GraphCell:
     def __init__(self, worker, cfg, stretch, font, font_sm, font_bold, font_sm_bold):
-        self.worker   = worker
-        self.cfg      = cfg
-        self.stretch  = stretch
-        self.font     = font
-        self.font_sm  = font_sm
-        self.font_bold = font_bold
+        self.worker       = worker
+        self.cfg          = cfg
+        self.stretch      = stretch
+        self.font         = font
+        self.font_sm      = font_sm
+        self.font_bold    = font_bold
         self.font_sm_bold = font_sm_bold
-        self.surf     = None
-        self.rect     = None
-        self._pw      = 0
-        self._ph      = 0
+        self.surf         = None
+        self.rect         = None
+        self._pw          = 0
+        self._ph          = 0
         self._rendered_total = 0
-        self._last_gmin = None
-        self._last_gmax = None
+        self._last_gmin   = None
+        self._last_gmax   = None
 
     def _get_warn_row(self, gmin, gmax, ph):
         warn = self.cfg[I_WARN]
         if gmin < warn < gmax:
             return self._val_to_y(warn, gmin, gmax)
-        else:
-            return 0 if warn >= gmax else ph
+        return 0 if warn >= gmax else ph
 
     def _get_bad_row(self, gmin, gmax, ph):
         bad = self.cfg[I_BAD]
         if gmin < bad < gmax:
             return self._val_to_y(bad, gmin, gmax)
-        else:
-            return 0 if bad >= gmax else ph
+        return 0 if bad >= gmax else ph
 
     def _compute_scale(self, samples):
-        ymin = self.cfg[I_YMIN]
-        ymax = self.cfg[I_YMAX]
+        ymin  = self.cfg[I_YMIN]
+        ymax  = self.cfg[I_YMAX]
         valid = [v for v in samples if isinstance(v, float)]
-        if ymax is not None:
-            gmax = float(ymax)
-        else:
-            gmax = max(valid) * 1.20 if valid else 100.0
-        gmax = max(gmax, 1.0)
-        
-        if ymin is not None:
-            gmin = float(ymin)
-        else:
-            gmin = min(valid) * 0.85 if valid else 0.0
+        gmax  = float(ymax) if ymax is not None else (max(valid) * 1.20 if valid else 100.0)
+        gmax  = max(gmax, 1.0)
+        gmin  = float(ymin) if ymin is not None else (min(valid) * 0.85 if valid else 0.0)
         return gmin, gmax
 
     def _val_to_y(self, v, gmin, gmax):
@@ -512,18 +474,10 @@ class GraphCell:
             frac = (v - gmin) / max(gmax - gmin, 1e-9)
             return int((1.0 - max(0.0, min(1.0, frac))) * (ph - 1))
 
-        if gmin < warn < gmax:
-            warn_row = to_y(warn)
-        else:
-            warn_row = 0 if warn >= gmax else ph
-
-        if gmin < bad < gmax:
-            bad_row = to_y(bad)
-        else:
-            bad_row = 0 if bad >= gmax else ph
+        warn_row = to_y(warn) if gmin < warn < gmax else (0 if warn >= gmax else ph)
+        bad_row  = to_y(bad)  if gmin < bad  < gmax else (0 if bad  >= gmax else ph)
 
         self.surf.fill(C_BG)
-
         if bad_row > 0:
             pygame.draw.rect(self.surf, C_ZONE_BAD, (0, 0, pw, bad_row))
         if warn_row > bad_row:
@@ -541,26 +495,24 @@ class GraphCell:
         clamped  = max(gmin, min(val, gmax))
         data_row = self._val_to_y(clamped, gmin, gmax)
         color    = severity_color(val, warn, bad)
-
         pygame.draw.line(self.surf, color, (x, data_row), (x, ph - 1))
 
     def resize(self, rect):
         self.rect = rect
         pw = max(1, rect.width)
         ph = max(1, rect.height - PAD_BOT)
-        
+
         if pw == self._pw and ph == self._ph:
             return
-        
+
         self._pw = pw
         self._ph = ph
         self.surf = pygame.Surface((pw, ph))
         self.surf.fill(C_BG)
-        
         self._rendered_total = 0
-        self._last_gmin = None
-        self._last_gmax = None
-        
+        self._last_gmin      = None
+        self._last_gmax      = None
+
     def draw(self, screen):
         if self.surf is None or self.rect is None:
             return
@@ -572,12 +524,11 @@ class GraphCell:
 
         total_now = self.worker.total()
         samples   = self.worker.last_n(pw)
-        
+
         if not samples:
             return
-            
-        gmin, gmax = self._compute_scale(samples)
 
+        gmin, gmax   = self._compute_scale(samples)
         scale_changed = False
         if self._last_gmin is not None:
             span = max(gmax - gmin, 1e-9)
@@ -593,47 +544,47 @@ class GraphCell:
             for i, val in enumerate(samples):
                 self._paint_col(start + i, val, gmin, gmax)
             self._rendered_total = total_now
-            self._last_gmin = gmin
-            self._last_gmax = gmax
+            self._last_gmin      = gmin
+            self._last_gmax      = gmax
         elif new_cols > 0:
             new_cols = min(new_cols, pw)
             self.surf.scroll(-new_cols, 0)
-            bg_rect = pygame.Rect(pw - new_cols, 0, new_cols, ph)
+            bg_rect  = pygame.Rect(pw - new_cols, 0, new_cols, ph)
             self.surf.fill(C_BG, bg_rect)
-            
+
             warn_row = self._get_warn_row(gmin, gmax, ph)
-            bad_row = self._get_bad_row(gmin, gmax, ph)
-            
+            bad_row  = self._get_bad_row(gmin, gmax, ph)
+
             if bad_row > 0:
-                pygame.draw.rect(self.surf, C_ZONE_BAD, 
-                               (pw - new_cols, 0, new_cols, bad_row))
+                pygame.draw.rect(self.surf, C_ZONE_BAD,
+                                 (pw - new_cols, 0, new_cols, bad_row))
             if warn_row > bad_row:
-                pygame.draw.rect(self.surf, C_ZONE_WARN, 
-                               (pw - new_cols, bad_row, new_cols, warn_row - bad_row))
-            
+                pygame.draw.rect(self.surf, C_ZONE_WARN,
+                                 (pw - new_cols, bad_row, new_cols, warn_row - bad_row))
+
             new_vals = samples[-new_cols:]
             for i, val in enumerate(new_vals):
                 self._paint_col(pw - new_cols + i, val, gmin, gmax)
             self._rendered_total = total_now
-            self._last_gmin = gmin
-            self._last_gmax = gmax
+            self._last_gmin      = gmin
+            self._last_gmax      = gmax
 
         gx = self.rect.x
         gy = self.rect.y
         screen.blit(self.surf, (gx, gy))
 
-        # Draw grid lines
+        # Grid lines
         grid_surface = pygame.Surface((pw, ph), pygame.SRCALPHA)
         for i in range(5):
             frac = i / 4.0
-            y = int(frac * (ph - 1))
+            y    = int(frac * (ph - 1))
             pygame.draw.line(grid_surface, (*C_GRID, 64), (0, y), (pw - 1, y))
         screen.blit(grid_surface, (gx, gy))
 
-        # Helper functions for text rendering
-        def render_with_stroke(text, font, color, x, y, stroke_color=(0, 0, 0), stroke_width=2):
+        # ---- text helpers ----
+        def render_with_stroke(text, font, color, x, y, stroke_color=(0,0,0), stroke_width=2):
             text_surf = font.render(text, True, color)
-            w = text_surf.get_width() + stroke_width * 2
+            w = text_surf.get_width()  + stroke_width * 2
             h = text_surf.get_height() + stroke_width * 2
             temp_surf = pygame.Surface((w, h), pygame.SRCALPHA)
             for dx in range(-stroke_width, stroke_width + 1):
@@ -648,19 +599,18 @@ class GraphCell:
 
         def render_with_bg(text, font, color, x, y):
             text_surf = font.render(text, True, color)
-            bg_surf = pygame.Surface((text_surf.get_width(), text_surf.get_height()))
+            bg_surf   = pygame.Surface((text_surf.get_width(), text_surf.get_height()))
             bg_surf.fill((0, 0, 0))
-            screen.blit(bg_surf, (x, y))
+            screen.blit(bg_surf,   (x, y))
             screen.blit(text_surf, (x, y))
 
         # Y-axis labels
         grange = max(gmax - gmin, 1e-9)
-        fmt = "%.1f" if grange < 20 else "%.0f"
+        fmt    = "%.1f" if grange < 20 else "%.0f"
         for i in range(5):
             frac = i / 4.0
-            val = gmax - frac * grange
-            y = gy + int(frac * (ph - 1))
-            lbl_text = fmt % val
+            val  = gmax - frac * grange
+            y    = gy + int(frac * (ph - 1))
             x_pos = gx + 1
             if i == 0:
                 y_pos = gy + 1
@@ -668,42 +618,38 @@ class GraphCell:
                 y_pos = gy + ph - FONT_SZ_SM - 1
             else:
                 y_pos = y - FONT_SZ_SM // 2
-            render_with_bg(lbl_text, self.font_sm_bold, C_AXIS, x_pos, y_pos)
+            render_with_bg(fmt % val, self.font_sm_bold, C_AXIS, x_pos, y_pos)
 
         # Stats
-        valid = [v for v in samples if isinstance(v, float)]
-        loss_n = sum(1 for v in samples if v is None)
+        valid   = [v for v in samples if isinstance(v, float)]
+        loss_n  = sum(1 for v in samples if v is None)
         loss_pct = 100.0 * loss_n / len(samples) if samples else 0.0
-        avg = sum(valid) / len(valid) if valid else 0.0
-        mn = min(valid) if valid else 0.0
-        mx = max(valid) if valid else 0.0
-        last = valid[-1] if valid else None
+        avg  = sum(valid) / len(valid) if valid else 0.0
+        mn   = min(valid) if valid else 0.0
+        mx   = max(valid) if valid else 0.0
+        last = valid[-1]  if valid else None
 
         def format_val(val):
-            if val is None:
-                return "!    "
-            if val < 10:
-                return f"{val:.1f}".ljust(4)
-            elif val < 100:
-                return f"{val:.0f}".ljust(3)
-            else:
-                return f"{val:.0f}".ljust(4)
-        
+            if val is None:    return "!    "
+            if val < 10:       return f"{val:.1f}".ljust(4)
+            elif val < 100:    return f"{val:.0f}".ljust(3)
+            else:              return f"{val:.0f}".ljust(4)
+
         stats_line = f"last:{format_val(last)}  min:{format_val(mn)}  max:{format_val(mx)}  avg:{format_val(avg)}"
-        lost_line = f"lost:{loss_n} ({loss_pct:.0f}%)"
+        lost_line  = f"lost:{loss_n} ({loss_pct:.0f}%)"
 
         host_surf = self.font_bold.render(host, True, C_AXIS)
-        host_x = gx + (pw - host_surf.get_width()) // 2
-        render_with_stroke(host, self.font_bold, C_AXIS, host_x, gy + 0)
-        render_with_stroke(stats_line, self.font_bold, C_AXIS, gx + 4, gy + FONT_SZ + 2)
-        render_with_stroke(lost_line, self.font_bold, C_AXIS, gx + 4, gy + FONT_SZ + 2 + FONT_SZ + 1)
+        host_x    = gx + (pw - host_surf.get_width()) // 2
+        render_with_stroke(host,       self.font_bold,    C_AXIS, host_x,  gy + 0)
+        render_with_stroke(stats_line, self.font_bold,    C_AXIS, gx + 4,  gy + FONT_SZ + 2)
+        render_with_stroke(lost_line,  self.font_bold,    C_AXIS, gx + 4,  gy + FONT_SZ + 2 + FONT_SZ + 1)
 
         # Time labels
         num_ticks = max(2, pw // 100)
         ty = gy + ph + 0
         for i in range(num_ticks + 1):
-            frac = i / num_ticks
-            x = gx + int(frac * (pw - 1))
+            frac     = i / num_ticks
+            x        = gx + int(frac * (pw - 1))
             secs_ago = int((1.0 - frac) * pw / max(rate, 0.01))
             if secs_ago == 0:
                 label = "now"
@@ -715,7 +661,7 @@ class GraphCell:
                 label = f"-{secs_ago//3600}h"
             else:
                 label = f"-{secs_ago//86400}d"
-            
+
             if i == 0:
                 x_pos = x + 2
             elif i == num_ticks:
@@ -754,11 +700,10 @@ def main():
     PAYLOAD_SIZE = max(0, args.payload)
     fps          = max(1, args.fps)
 
-    # Parse hosts and create workers
     hosts   = split_hosts(args.hosts)
     cfgs    = [parse_host(h) for h in hosts]
     workers = [Worker(c[0], c[1]) for c in cfgs]
-    for w in workers: 
+    for w in workers:
         w.start()
 
     os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
@@ -767,27 +712,25 @@ def main():
     pygame.display.set_caption("gpngr")
 
     def get_bold_font(size):
-        font_names = ['DejaVu Sans Mono', 'Courier New', 'Consolas', 'Monospace']
-        for name in font_names:
+        for name in ['DejaVu Sans Mono', 'Courier New', 'Consolas', 'Monospace']:
             try:
                 font = pygame.font.SysFont(name, size, bold=True)
-                test_surf = font.render("W", True, (255,255,255))
-                if test_surf.get_width() > 0:
+                if font.render("W", True, (255,255,255)).get_width() > 0:
                     return font
             except:
                 continue
         return pygame.font.SysFont("monospace", size, bold=True)
 
-    font = pygame.font.SysFont("monospace", FONT_SZ)
-    font_sm = pygame.font.SysFont("monospace", FONT_SZ_SM)
-    font_bold = get_bold_font(FONT_SZ)
+    font         = pygame.font.SysFont("monospace", FONT_SZ)
+    font_sm      = pygame.font.SysFont("monospace", FONT_SZ_SM)
+    font_bold    = get_bold_font(FONT_SZ)
     font_sm_bold = get_bold_font(FONT_SZ_SM)
 
-    is_wsl = "microsoft" in platform.uname().release.lower() or "WSL_DISTRO_NAME" in os.environ
+    is_wsl  = "microsoft" in platform.uname().release.lower() or "WSL_DISTRO_NAME" in os.environ
     want_fs = not args.windowed and not is_wsl
 
     if want_fs:
-        info = pygame.display.Info()
+        info   = pygame.display.Info()
         sw, sh = info.current_w, info.current_h
         screen = pygame.display.set_mode((sw, sh), pygame.FULLSCREEN | pygame.NOFRAME)
     else:
@@ -796,8 +739,8 @@ def main():
     fullscreen = want_fs
 
     gr, gc = auto_layout(len(workers), args.rows, args.cols)
-    cells = [GraphCell(w, cfg, args.stretch, font, font_sm, font_bold, font_sm_bold)
-             for w, cfg in zip(workers, cfgs)]
+    cells  = [GraphCell(w, cfg, args.stretch, font, font_sm, font_bold, font_sm_bold)
+              for w, cfg in zip(workers, cfgs)]
 
     def layout_cells():
         W, H = screen.get_size()
@@ -831,7 +774,7 @@ def main():
                 elif event.key == pygame.K_f:
                     fullscreen = not fullscreen
                     if fullscreen:
-                        info = pygame.display.Info()
+                        info   = pygame.display.Info()
                         sw, sh = info.current_w, info.current_h
                         screen = pygame.display.set_mode((sw, sh), pygame.FULLSCREEN | pygame.NOFRAME)
                     else:
@@ -857,7 +800,6 @@ def main():
         pygame.display.flip()
         clock.tick(fps)
 
-    # Cleanup
     for worker in workers:
         worker.stop()
     if _icmp_manager:
